@@ -117,7 +117,22 @@ jobs:
         run: |
           image="$(head -n1 <<< "${TAGS}")-${ARCH}"
           docker run -d --name smoke --platform "${PLATFORM}" -p 33000:3000 "${image}"
-          curl -fsS --retry 30 --retry-delay 1 --retry-connrefused http://localhost:33000/
+
+          # Docker publishes the port before Node starts listening, so an early
+          # request is reset rather than refused. Poll for the expected body
+          # instead of relying on curl --retry-connrefused, which only covers
+          # refused connections.
+          for attempt in $(seq 1 60); do
+            body="$(curl -fsS http://localhost:33000/ 2>/dev/null)" && break
+            sleep 1
+          done
+
+          if [[ "${body:-}" != "Hello Hono!" ]]; then
+            echo "::error::Smoke test failed (response: '${body:-<empty>}')"
+            docker logs smoke
+            exit 1
+          fi
+          echo "Smoke test passed: ${body}"
 
       - name: Remove smoke container
         if: always()
