@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 ARG NODE_IMAGE=node:26-slim
-ARG RUNTIME_IMAGE=ghcr.io/agungdh/chiseled-runtimes/nodejs:26-ubuntu26.04
+ARG RUNTIME_IMAGE=node:26-slim
 
 FROM ${NODE_IMAGE} AS deps
 WORKDIR /app
@@ -19,10 +19,13 @@ RUN npm run build
 FROM ${RUNTIME_IMAGE}
 
 ENV NODE_ENV=production
+WORKDIR /app
 
-COPY --from=deps --chown=10001:10001 /app/node_modules ./node_modules
-COPY --from=builder --chown=10001:10001 /app/dist ./dist
-COPY --chown=10001:10001 package.json ./package.json
+COPY --from=deps --chown=node:node /app/node_modules ./node_modules
+COPY --from=builder --chown=node:node /app/dist ./dist
+COPY --chown=node:node package.json ./package.json
+
+USER node
 
 EXPOSE 3000
 
