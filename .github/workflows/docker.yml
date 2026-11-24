@@ -1,0 +1,160 @@
+name: docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  meta:
+    name: Metadata
+    runs-on: ubuntu-26.04
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # GHCR rejects uppercase repository names.
+      - name: Compute image name
+        id: image
+        run: echo "name=${REGISTRY}/${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-26.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Each architecture is tagged "<tag>-<arch>" so the merge job can
+      # assemble the final multi-arch manifest.
+      - name: Compute per-arch tags
+        id: tags
+        env:
+          TAGS: ${{ needs.meta.outputs.tags }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          {
+            echo "tags<<TAGS_EOF"
+            while IFS= read -r tag; do
+              [[ -n "${tag}" ]] || continue
+              echo "${tag}-${ARCH}"
+            done <<< "${TAGS}"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ needs.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Smoke test
+        env:
+          TAGS: ${{ needs.meta.outputs.tags }}
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          image="$(head -n1 <<< "${TAGS}")-${ARCH}"
+          docker run -d --name smoke --platform "${PLATFORM}" -p 33000:3000 "${image}"
+          curl -fsS --retry 30 --retry-delay 1 --retry-connrefused http://localhost:33000/
+
+      - name: Remove smoke container
+        if: always()
+        run: docker rm -f smoke || true
+
+  merge:
+    name: Merge multi-arch manifests
+    needs: [meta, build]
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build.result == 'success' }}
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch tags
+        env:
+          TAGS: ${{ needs.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Multi-arch images"
+            echo ""
+            echo "| Tag | Digest |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r tag; do
+            [[ -n "${tag}" ]] || continue
+            echo "::group::${tag}"
+            docker buildx imagetools create \
+              --tag "${tag}" \
+              "${tag}-amd64" \
+              "${tag}-arm64"
+            digest="$(docker buildx imagetools inspect "${tag}" --format '{{.Manifest.Digest}}')"
+            echo "| \`${tag}\` | \`${digest}\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+          done <<< "${TAGS}"
